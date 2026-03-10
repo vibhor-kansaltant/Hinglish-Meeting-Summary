@@ -1,0 +1,10 @@
+openai-whisper
+sounddevice
+numpy
+psutil
+scipy
+anthropic
+pystray
+pillow
+truststore
+pycaw
