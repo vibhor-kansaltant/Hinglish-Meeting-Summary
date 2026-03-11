@@ -307,26 +307,57 @@ class ZoomTranscriber:
     def _transcribe(self, audio: np.ndarray) -> str:
         if audio is None or len(audio) < SAMPLE_RATE:
             return ""
+        # Skip near-silent chunks — prevents Whisper from hallucinating prompt text
+        rms = float(np.sqrt(np.mean(audio ** 2)))
+        if rms < 0.002:
+            return ""
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             tmp = f.name
         try:
             audio_i16 = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16)
             wavfile.write(tmp, SAMPLE_RATE, audio_i16)
 
-            hinglish_prompt = (
-                "Transcript of a business meeting in Hinglish — Hindi spoken words "
-                "are written in Roman (English) letters, not Devanagari script. "
-                "Examples: 'Aaj hum yeh decide karenge ki aage kya karna hai.' "
-                "'Theek hai, toh chalte hain next point pe.' "
-                "'Let's quickly discuss the key points aur phir wrap up karte hain.'"
-            )
+            # Short Hinglish prompt — guides Whisper toward Roman-script output.
+            # Keep it minimal to reduce hallucination risk on silent/noisy chunks.
+            hinglish_prompt = "Theek hai. Haan."
 
             result = self.model.transcribe(
                 tmp,
+                language=None,          # auto-detect: captures Hindi, English, Hinglish
                 beam_size=5,
+                fp16=False,
+                condition_on_previous_text=False,
                 initial_prompt=hinglish_prompt,
+                no_speech_threshold=0.8,        # suppress hallucinations on silence (higher = less filtering)
+                compression_ratio_threshold=2.4, # detect & reject repetitive outputs
             )
-            return result["text"].strip()
+            text = result["text"].strip()
+
+            # Guard against hallucinations:
+            # 1. Reject if a sentence repeats 2+ times (Whisper looping)
+            sentences = [s.strip() for s in text.replace(".", "|").replace("?", "|").replace("!", "|").split("|") if s.strip()]
+            if len(sentences) >= 3:
+                if len(set(sentences)) == 1:
+                    return ""  # all sentences identical
+                # Check if any sentence appears 3+ times
+                from collections import Counter
+                counts = Counter(sentences)
+                if counts.most_common(1)[0][1] >= 3:
+                    return ""
+
+            # 2. Reject known Whisper hallucinations (common on silence/background noise)
+            HALLUCINATIONS = {
+                "theek hai", "haan", "theek hai haan",
+                "thank you for watching", "thank you", "thanks for watching",
+                "please subscribe", "subscribe", "like and subscribe",
+                "transcript of a business meeting in hinglish",
+                "hindi words in roman script", "hinglish",
+                "[music]", "[applause]", "[silence]",
+            }
+            if text.lower().strip(".").strip("!").strip("?").strip() in HALLUCINATIONS:
+                return ""
+
+            return text
 
         except Exception as exc:
             print(f"[WARN] Transcription error: {exc}")
